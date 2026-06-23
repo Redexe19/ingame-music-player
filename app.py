@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request, jsonify
 import yt_dlp
 
@@ -12,7 +13,7 @@ def youtube():
     if q:
         ydl_opts = {
             'format': 'bestaudio/best',
-            'extract_flat': True, # Keeps search extremely fast by not extracting full audio streams yet
+            'extract_flat': True, # Keeps search extremely fast
             'noplaylist': True,
             'default_search': 'ytsearch10', # Grabs top 10 results
         }
@@ -21,7 +22,6 @@ def youtube():
                 info = ydl.extract_info(q, download=False)
                 results = []
                 for entry in info.get('entries', []):
-                    # Safely grab the thumbnail if it exists
                     thumbnails = entry.get('thumbnails', [])
                     thumb_url = thumbnails[0]['url'] if thumbnails else ''
                     
@@ -49,8 +49,6 @@ def youtube():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 
-                # info['url'] contains the temporary, direct playable audio stream link
-                # It bypasses the webpage and points straight to the media server
                 return jsonify({
                     "streamUrl": info.get('url'),
                     "contentType": "audio/mpeg", 
@@ -67,6 +65,6 @@ def youtube():
     return jsonify({"error": "Missing 'q' or 'videoId' parameter"}), 400
 
 if __name__ == '__main__':
-    # Runs on port 8787 locally as expected by the mod's default config
-    app.run(host='0.0.0.0', port=8787)
-  
+    # Grab Render's dynamic PORT, or default to 8787 for local testing
+    port = int(os.environ.get('PORT', 8787))
+    app.run(host='0.0.0.0', port=port)
