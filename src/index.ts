@@ -15,7 +15,11 @@ async function getYouTube(): Promise<Innertube> {
   if (ytClient) return ytClient;
   if (ytInitPromise) return ytInitPromise;
 
-  ytInitPromise = Innertube.create({ generate_session_locally: true })
+  ytInitPromise = Innertube.create({
+    generate_session_locally: true,
+    location: "US",   // CRITICAL: Bypasses EU GDPR consent wall on Render
+    language: "en",
+  })
     .then((client) => {
       ytClient = client;
       return client;
@@ -72,9 +76,9 @@ app.get("/stream/:videoId", async (c) => {
     const yt = await getYouTube();
     const info = await yt.getInfo(videoId);
 
-    // Get audio formats, sorted by bitrate (best first)
+    // Safer format filtering: check flags instead of string parsing
     const audioFormats = (info.streaming_data?.adaptive_formats || [])
-      .filter((f: any) => f.mime_type?.startsWith("audio/"))
+      .filter((f: any) => f.has_audio && !f.has_video)
       .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
 
     if (!audioFormats.length) {
@@ -95,9 +99,9 @@ app.get("/stream/:videoId", async (c) => {
       return c.json({ error: "Stream fetch failed" }, 502);
     }
 
-    // Pass through with real Content-Type (webm/mp4, your mod handles decoding)
+    // Pass through with real Content-Type, fallback to audio/mp4 just in case
     const headers: Record<string, string> = {
-      "Content-Type": fmt.mime_type,
+      "Content-Type": fmt.mime_type || "audio/mp4",
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
     };
@@ -163,11 +167,14 @@ async function resolve(c: any, videoId: string) {
     const info = await yt.getInfo(videoId);
     const basic = info.basic_info || {};
 
+    // Safer format filtering
     const audioFormats = (info.streaming_data?.adaptive_formats || [])
-      .filter((f: any) => f.mime_type?.startsWith("audio/"))
+      .filter((f: any) => f.has_audio && !f.has_video)
       .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
 
     if (!audioFormats.length) {
+      // Log to Render logs so you can see if a video is genuinely restricted
+      console.error(`[Resolve] No audio formats for ${videoId}. Playable: ${basic.is_playable}, Status: ${basic.status}`);
       return c.json({ error: "No audio available" }, 404);
     }
 
@@ -175,7 +182,7 @@ async function resolve(c: any, videoId: string) {
 
     return c.json({
       streamUrl: `${getBaseUrl(c)}/stream/${videoId}`,
-      contentType: fmt.mime_type,
+      contentType: fmt.mime_type || "audio/mp4",
       title: basic.title || "",
       artist: basic.channel?.name || "",
       durationSeconds: basic.duration || 0,
