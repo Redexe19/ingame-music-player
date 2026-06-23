@@ -19,6 +19,7 @@ async function getYouTube(): Promise<Innertube> {
     generate_session_locally: true,
     location: "US",
     language: "en",
+    client: "TV" // Bypasses datacenter bot checks
   })
     .then((client) => {
       ytClient = client;
@@ -83,7 +84,8 @@ app.get("/stream/:videoId", async (c) => {
     }
 
     const fetchHeaders: Record<string, string> = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      // TV clients use a generic Android TV user agent for streams
+      "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     };
     if (range) fetchHeaders["Range"] = range;
 
@@ -97,7 +99,7 @@ app.get("/stream/:videoId", async (c) => {
     }
 
     const respHeaders: Record<string, string> = {
-      "Content-Type": fmt.mime_type || "audio/mp4",
+      "Content-Type": fmt.mime_type || "audio/webm", // TV usually returns webm/opus
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
     };
@@ -115,7 +117,7 @@ app.get("/stream/:videoId", async (c) => {
   }
 });
 
-// ─── Core Format Logic (Updated per Codex) ───────────────────────
+// ─── Core Format Logic ───────────────────────────────────────────
 
 function findBestFormat(info: any) {
   const formats = info.streaming_data?.adaptive_formats || [];
@@ -124,7 +126,6 @@ function findBestFormat(info: any) {
     return null;
   }
 
-  // Detect audio by mime_type, audio_quality, audio_sample_rate, or audio_channels
   const audioFormats = formats.filter((f: any) => {
     const mime = String(f.mime_type || f.mimeType || "").toLowerCase();
     return (
@@ -139,29 +140,19 @@ function findBestFormat(info: any) {
     );
   });
 
-  // 1. Strictly find MP4 / M4A / AAC first
+  // 1. Try to find MP4 / M4A / AAC first
   let best = audioFormats
     .filter((f: any) => String(f.mime_type || f.mimeType || "").includes("mp4"))
     .sort((a: any, b: any) => (b.bitrate || b.average_bitrate || 0) - (a.bitrate || a.average_bitrate || 0))[0];
 
-  // 2. Fallback to ANY audio if MP4 doesn't exist
+  // 2. Fallback to ANY audio (TV client usually returns WebM/Opus, which your mod handles)
   if (!best) {
     best = audioFormats
       .sort((a: any, b: any) => (b.bitrate || b.average_bitrate || 0) - (a.bitrate || a.average_bitrate || 0))[0];
   }
 
-  // Debug log if we STILL found nothing, so we can see exactly what YouTube returned
   if (!best) {
-    console.log(
-      "[Format] No audio formats detected. Raw formats:",
-      formats.map((f: any) => ({
-        itag: f.itag,
-        mime: f.mime_type || f.mimeType,
-        bitrate: f.bitrate,
-        audioQuality: f.audio_quality || f.audioQuality,
-        hasUrl: !!f.url
-      }))
-    );
+    console.log("[Format] No audio formats detected. Raw formats:", formats.map((f: any) => ({ itag: f.itag, mime: f.mime_type || f.mimeType, bitrate: f.bitrate, hasUrl: !!f.url })));
   }
 
   return best || null;
@@ -225,7 +216,7 @@ async function resolve(c: any, videoId: string) {
 
     return c.json({
       streamUrl: `${getBaseUrl(c)}/stream/${videoId}`,
-      contentType: fmt.mime_type || "audio/mp4",
+      contentType: fmt.mime_type || "audio/webm",
       title: basic.title || "",
       artist: basic.channel?.name || "",
       durationSeconds: basic.duration || 0,
