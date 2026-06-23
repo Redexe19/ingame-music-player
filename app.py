@@ -4,6 +4,14 @@ import yt_dlp
 
 app = Flask(__name__)
 
+# Shared extractor configuration to sneak past YouTube's datacenter blocks
+YOUTUBE_EXTRACTOR_ARGS = {
+    'youtube': {
+        'player_client': ['all', '-web'],  # Uses all alternative clients (Android, TV, etc.) but avoids the heavily blocked standard Web client
+        'formats': ['missing_pot']        # Allows streaming formats that skip strict PO Token requirements
+    }
+}
+
 @app.route('/youtube', methods=['GET'])
 def youtube():
     q = request.args.get('q')
@@ -13,9 +21,11 @@ def youtube():
     if q:
         ydl_opts = {
             'format': 'bestaudio/best',
-            'extract_flat': True, # Keeps search extremely fast
+            'extract_flat': True, 
             'noplaylist': True,
-            'default_search': 'ytsearch10', # Grabs top 10 results
+            'default_search': 'ytsearch10',
+            'extractor_args': YOUTUBE_EXTRACTOR_ARGS,
+            'quiet': True
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -43,6 +53,7 @@ def youtube():
         ydl_opts = {
             'format': 'bestaudio/best', 
             'noplaylist': True,
+            'extractor_args': YOUTUBE_EXTRACTOR_ARGS,
             'quiet': True
         }
         try:
@@ -59,12 +70,11 @@ def youtube():
                     "originalUrl": url
                 })
         except Exception as e:
-            return jsonify({"error": "Video unavailable or not playable"}), 404
+            return jsonify({"error": "Video unavailable or not playable", "details": str(e)}), 404
 
     # 3. ERROR FLOW
     return jsonify({"error": "Missing 'q' or 'videoId' parameter"}), 400
 
 if __name__ == '__main__':
-    # Grab Render's dynamic PORT, or default to 8787 for local testing
     port = int(os.environ.get('PORT', 8787))
     app.run(host='0.0.0.0', port=port)
