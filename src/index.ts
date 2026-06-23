@@ -68,6 +68,7 @@ app.get("/youtube", async (c) => {
   return c.json({ error: "Missing 'q' or 'videoId'" }, 400);
 });
 
+// THE PROXY ENDPOINT - Turns YouTube's messy auth URLs into clean raw audio for Minecraft
 app.get("/stream/:videoId", async (c) => {
   const videoId = c.req.param("videoId");
   const range = c.req.header("Range");
@@ -77,39 +78,39 @@ app.get("/stream/:videoId", async (c) => {
     const info = await yt.getInfo(videoId);
     const fmt = findBestFormat(info);
 
-    if (!fmt) {
+    if (!fmt || !fmt.url) {
       return c.json({ error: "No audio available" }, 404);
     }
 
-    // Force URL deciphering to happen here on the server
-    const audioUrl = fmt.url;
-    if (!audioUrl) {
-      return c.json({ error: "Failed to decipher audio URL" }, 502);
-    }
-
     const fetchHeaders: Record<string, string> = {
+      // This specific User-Agent is REQUIRED to bypass YouTube's bot detection on the raw stream
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     };
     if (range) fetchHeaders["Range"] = range;
 
-    const res = await fetch(audioUrl, { headers: fetchHeaders });
+    // Fetch the raw bytes from YouTube
+    const res = await fetch(fmt.url, { 
+      headers: fetchHeaders,
+      redirect: "follow" // Follow any YouTube redirects automatically
+    });
 
     if (!res.ok && res.status !== 206) {
-      return c.json({ error: "Stream fetch failed" }, 502);
+      return c.json({ error: "Upstream stream failed" }, 502);
     }
 
-    const headers: Record<string, string> = {
+    // Pipe raw audio bytes directly to Minecraft
+    const respHeaders: Record<string, string> = {
       "Content-Type": fmt.mime_type || "audio/mp4",
       "Accept-Ranges": "bytes",
-      "Cache-Control": "no-store",
+      "Cache-Control": "no-store", // Don't cache, YouTube URLs expire fast
     };
 
     const len = res.headers.get("Content-Length");
-    if (len) headers["Content-Length"] = len;
+    if (len) respHeaders["Content-Length"] = len;
     const cr = res.headers.get("Content-Range");
-    if (cr) headers["Content-Range"] = cr;
+    if (cr) respHeaders["Content-Range"] = cr;
 
-    return new Response(res.body, { status: res.status, headers });
+    return new Response(res.body, { status: res.status, headers: respHeaders });
   } catch (err: any) {
     console.error(`[Stream Error] ${videoId}: ${err.message}`);
     if (err.message?.includes("session")) await resetYouTube();
@@ -120,9 +121,7 @@ app.get("/stream/:videoId", async (c) => {
 // ─── Core Format Logic ───────────────────────────────────────────
 
 function findBestFormat(info: any) {
-  if (!info.streaming_data?.adaptive_formats?.length) {
-    return null;
-  }
+  if (!info.streaming_data?.adaptive_formats?.length) return null;
 
   const formats = info.streaming_data.adaptive_formats;
 
@@ -131,7 +130,7 @@ function findBestFormat(info: any) {
     .filter((f: any) => f.has_audio && !f.has_video && f.mime_type?.includes("mp4"))
     .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
-  // 2. Fallback to ANY audio if MP4 doesn't exist (very rare)
+  // 2. Fallback to ANY audio if MP4 doesn't exist
   if (!best) {
     best = formats
       .filter((f: any) => f.has_audio && !f.has_video)
@@ -187,26 +186,19 @@ async function resolve(c: any, videoId: string) {
     const yt = await getYouTube();
     const info = await yt.getInfo(videoId);
     const basic = info.basic_info || {};
-    const status = info.playability_status?.status;
-
-    // Log exactly what YouTube tells us to Render logs
-    console.log(`[Resolve] ${videoId} | Playability: ${status} | Formats: ${info.streaming_data?.adaptive_formats?.length || 0}`);
+    
+    // Log for Render debugging
+    console.log(`[Resolve] ${videoId} | Status: ${info.playability_status?.status} | Formats: ${info.streaming_data?.adaptive_formats?.length || 0}`);
 
     const fmt = findBestFormat(info);
 
-    if (!fmt) {
-      console.error(`[Resolve Failed] ${videoId} | Reason: ${info.playability_status?.reason || "Unknown"}`);
+    if (!fmt || !fmt.url) {
+      console.error(`[Resolve Failed] ${videoId} | Reason: ${info.playability_status?.reason || "No formats"}`);
       return c.json({ error: "No audio available" }, 404);
     }
 
-    // Force URL extraction BEFORE returning (triggers signature decipher)
-    const directUrl = fmt.url; 
-    if (!directUrl) {
-       console.error(`[Resolve Failed] ${videoId} | Decipher returned empty URL`);
-       return c.json({ error: "Could not extract audio URL" }, 502);
-    }
-
     return c.json({
+      // Give the mod the clean proxy URL, NOT the YouTube URL
       streamUrl: `${getBaseUrl(c)}/stream/${videoId}`,
       contentType: fmt.mime_type || "audio/mp4",
       title: basic.title || "",
@@ -218,7 +210,6 @@ async function resolve(c: any, videoId: string) {
   } catch (err: any) {
     console.error(`[Resolve Error] ${videoId}: ${err.message}`);
     
-    // If session broke, reset and try exactly ONE more time
     if (err.message?.includes("session") || err.message?.includes("auth") || err.message?.includes("403")) {
       await resetYouTube();
       try {
