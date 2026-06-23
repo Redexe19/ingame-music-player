@@ -3,7 +3,7 @@
 Copyright © 2026 Redexe19/RX.  
 All rights reserved.
 
-This project, including but not limited to its source code, compiled files, assets, documentation, designs, names, branding, and any related materials, is owned by [YOUR NAME / ALIAS], unless otherwise stated.
+This project, including but not limited to its source code, compiled files, assets, documentation, designs, names, branding, and any related materials, is owned by Redexe19/Redz, unless otherwise stated.
 
 **This is NOT an open-source license.**
 
