@@ -68,7 +68,7 @@ app.get("/youtube", async (c) => {
   return c.json({ error: "Missing 'q' or 'videoId'" }, 400);
 });
 
-// THE PROXY ENDPOINT - Turns YouTube's messy auth URLs into clean raw audio for Minecraft
+// THE PROXY ENDPOINT
 app.get("/stream/:videoId", async (c) => {
   const videoId = c.req.param("videoId");
   const range = c.req.header("Range");
@@ -83,26 +83,23 @@ app.get("/stream/:videoId", async (c) => {
     }
 
     const fetchHeaders: Record<string, string> = {
-      // This specific User-Agent is REQUIRED to bypass YouTube's bot detection on the raw stream
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     };
     if (range) fetchHeaders["Range"] = range;
 
-    // Fetch the raw bytes from YouTube
     const res = await fetch(fmt.url, { 
       headers: fetchHeaders,
-      redirect: "follow" // Follow any YouTube redirects automatically
+      redirect: "follow" 
     });
 
     if (!res.ok && res.status !== 206) {
       return c.json({ error: "Upstream stream failed" }, 502);
     }
 
-    // Pipe raw audio bytes directly to Minecraft
     const respHeaders: Record<string, string> = {
       "Content-Type": fmt.mime_type || "audio/mp4",
       "Accept-Ranges": "bytes",
-      "Cache-Control": "no-store", // Don't cache, YouTube URLs expire fast
+      "Cache-Control": "no-store",
     };
 
     const len = res.headers.get("Content-Length");
@@ -118,26 +115,56 @@ app.get("/stream/:videoId", async (c) => {
   }
 });
 
-// ─── Core Format Logic ───────────────────────────────────────────
+// ─── Core Format Logic (Updated per Codex) ───────────────────────
 
 function findBestFormat(info: any) {
-  if (!info.streaming_data?.adaptive_formats?.length) return null;
+  const formats = info.streaming_data?.adaptive_formats || [];
+  if (!formats.length) {
+    console.error("[Format] No adaptive formats found at all.");
+    return null;
+  }
 
-  const formats = info.streaming_data.adaptive_formats;
+  // Detect audio by mime_type, audio_quality, audio_sample_rate, or audio_channels
+  const audioFormats = formats.filter((f: any) => {
+    const mime = String(f.mime_type || f.mimeType || "").toLowerCase();
+    return (
+      mime.startsWith("audio/") ||
+      mime.includes("audio") ||
+      f.audio_quality ||
+      f.audioQuality ||
+      f.audio_sample_rate ||
+      f.audioSampleRate ||
+      f.audio_channels ||
+      f.audioChannels
+    );
+  });
 
-  // 1. STRICTLY find MP4 / M4A / AAC first
-  let best = formats
-    .filter((f: any) => f.has_audio && !f.has_video && f.mime_type?.includes("mp4"))
-    .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+  // 1. Strictly find MP4 / M4A / AAC first
+  let best = audioFormats
+    .filter((f: any) => String(f.mime_type || f.mimeType || "").includes("mp4"))
+    .sort((a: any, b: any) => (b.bitrate || b.average_bitrate || 0) - (a.bitrate || a.average_bitrate || 0))[0];
 
   // 2. Fallback to ANY audio if MP4 doesn't exist
   if (!best) {
-    best = formats
-      .filter((f: any) => f.has_audio && !f.has_video)
-      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    best = audioFormats
+      .sort((a: any, b: any) => (b.bitrate || b.average_bitrate || 0) - (a.bitrate || a.average_bitrate || 0))[0];
   }
 
-  return best;
+  // Debug log if we STILL found nothing, so we can see exactly what YouTube returned
+  if (!best) {
+    console.log(
+      "[Format] No audio formats detected. Raw formats:",
+      formats.map((f: any) => ({
+        itag: f.itag,
+        mime: f.mime_type || f.mimeType,
+        bitrate: f.bitrate,
+        audioQuality: f.audio_quality || f.audioQuality,
+        hasUrl: !!f.url
+      }))
+    );
+  }
+
+  return best || null;
 }
 
 // ─── Handlers ────────────────────────────────────────────────────
@@ -187,7 +214,6 @@ async function resolve(c: any, videoId: string) {
     const info = await yt.getInfo(videoId);
     const basic = info.basic_info || {};
     
-    // Log for Render debugging
     console.log(`[Resolve] ${videoId} | Status: ${info.playability_status?.status} | Formats: ${info.streaming_data?.adaptive_formats?.length || 0}`);
 
     const fmt = findBestFormat(info);
@@ -198,7 +224,6 @@ async function resolve(c: any, videoId: string) {
     }
 
     return c.json({
-      // Give the mod the clean proxy URL, NOT the YouTube URL
       streamUrl: `${getBaseUrl(c)}/stream/${videoId}`,
       contentType: fmt.mime_type || "audio/mp4",
       title: basic.title || "",
