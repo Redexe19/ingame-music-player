@@ -17,7 +17,7 @@ async function getYouTube(): Promise<Innertube> {
 
   ytInitPromise = Innertube.create({
     generate_session_locally: true,
-    location: "US",   // CRITICAL: Bypasses EU GDPR consent wall on Render
+    location: "US",
     language: "en",
   })
     .then((client) => {
@@ -75,31 +75,29 @@ app.get("/stream/:videoId", async (c) => {
   try {
     const yt = await getYouTube();
     const info = await yt.getInfo(videoId);
+    const fmt = findBestFormat(info);
 
-    // Safer format filtering: check flags instead of string parsing
-    const audioFormats = (info.streaming_data?.adaptive_formats || [])
-      .filter((f: any) => f.has_audio && !f.has_video)
-      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
-
-    if (!audioFormats.length) {
+    if (!fmt) {
       return c.json({ error: "No audio available" }, 404);
     }
 
-    const fmt = audioFormats[0];
+    // Force URL deciphering to happen here on the server
+    const audioUrl = fmt.url;
+    if (!audioUrl) {
+      return c.json({ error: "Failed to decipher audio URL" }, 502);
+    }
 
-    // Fetch from YouTube
     const fetchHeaders: Record<string, string> = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     };
     if (range) fetchHeaders["Range"] = range;
 
-    const res = await fetch(fmt.url, { headers: fetchHeaders });
+    const res = await fetch(audioUrl, { headers: fetchHeaders });
 
     if (!res.ok && res.status !== 206) {
       return c.json({ error: "Stream fetch failed" }, 502);
     }
 
-    // Pass through with real Content-Type, fallback to audio/mp4 just in case
     const headers: Record<string, string> = {
       "Content-Type": fmt.mime_type || "audio/mp4",
       "Accept-Ranges": "bytes",
@@ -113,12 +111,35 @@ app.get("/stream/:videoId", async (c) => {
 
     return new Response(res.body, { status: res.status, headers });
   } catch (err: any) {
-    if (err.message?.includes("session") || err.message?.includes("auth")) {
-      await resetYouTube();
-    }
+    console.error(`[Stream Error] ${videoId}: ${err.message}`);
+    if (err.message?.includes("session")) await resetYouTube();
     return c.json({ error: "Stream failed" }, 500);
   }
 });
+
+// ─── Core Format Logic ───────────────────────────────────────────
+
+function findBestFormat(info: any) {
+  if (!info.streaming_data?.adaptive_formats?.length) {
+    return null;
+  }
+
+  const formats = info.streaming_data.adaptive_formats;
+
+  // 1. STRICTLY find MP4 / M4A / AAC first
+  let best = formats
+    .filter((f: any) => f.has_audio && !f.has_video && f.mime_type?.includes("mp4"))
+    .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+  // 2. Fallback to ANY audio if MP4 doesn't exist (very rare)
+  if (!best) {
+    best = formats
+      .filter((f: any) => f.has_audio && !f.has_video)
+      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+  }
+
+  return best;
+}
 
 // ─── Handlers ────────────────────────────────────────────────────
 
@@ -138,7 +159,7 @@ async function search(c: any, query: string) {
       })),
     });
   } catch (err: any) {
-    if (err.message?.includes("session") || err.message?.includes("auth")) {
+    if (err.message?.includes("session")) {
       await resetYouTube();
       try {
         const yt = await getYouTube();
@@ -166,19 +187,24 @@ async function resolve(c: any, videoId: string) {
     const yt = await getYouTube();
     const info = await yt.getInfo(videoId);
     const basic = info.basic_info || {};
+    const status = info.playability_status?.status;
 
-    // Safer format filtering
-    const audioFormats = (info.streaming_data?.adaptive_formats || [])
-      .filter((f: any) => f.has_audio && !f.has_video)
-      .sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
+    // Log exactly what YouTube tells us to Render logs
+    console.log(`[Resolve] ${videoId} | Playability: ${status} | Formats: ${info.streaming_data?.adaptive_formats?.length || 0}`);
 
-    if (!audioFormats.length) {
-      // Log to Render logs so you can see if a video is genuinely restricted
-      console.error(`[Resolve] No audio formats for ${videoId}. Playable: ${basic.is_playable}, Status: ${basic.status}`);
+    const fmt = findBestFormat(info);
+
+    if (!fmt) {
+      console.error(`[Resolve Failed] ${videoId} | Reason: ${info.playability_status?.reason || "Unknown"}`);
       return c.json({ error: "No audio available" }, 404);
     }
 
-    const fmt = audioFormats[0];
+    // Force URL extraction BEFORE returning (triggers signature decipher)
+    const directUrl = fmt.url; 
+    if (!directUrl) {
+       console.error(`[Resolve Failed] ${videoId} | Decipher returned empty URL`);
+       return c.json({ error: "Could not extract audio URL" }, 502);
+    }
 
     return c.json({
       streamUrl: `${getBaseUrl(c)}/stream/${videoId}`,
@@ -190,7 +216,10 @@ async function resolve(c: any, videoId: string) {
       originalUrl: `https://www.youtube.com/watch?v=${videoId}`,
     });
   } catch (err: any) {
-    if (err.message?.includes("session") || err.message?.includes("auth")) {
+    console.error(`[Resolve Error] ${videoId}: ${err.message}`);
+    
+    // If session broke, reset and try exactly ONE more time
+    if (err.message?.includes("session") || err.message?.includes("auth") || err.message?.includes("403")) {
       await resetYouTube();
       try {
         return await resolve(c, videoId);
@@ -198,13 +227,7 @@ async function resolve(c: any, videoId: string) {
         return c.json({ error: "Video unavailable" }, 404);
       }
     }
-    if (
-      err.message?.includes("not found") ||
-      err.message?.includes("unavailable") ||
-      err.message?.includes("PRIVATE")
-    ) {
-      return c.json({ error: "Video unavailable" }, 404);
-    }
+    
     return c.json({ error: "Resolve failed" }, 500);
   }
 }
