@@ -56,5 +56,10 @@ temporary upstream audio URL and proxies bytes through `/stream/<id>`.
   `bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best`.
 - `YTDLP_COOKIES_FILE` or `YOUTUBE_COOKIES_FILE`: optional path to a cookies
   file if the host needs an authenticated resolver session.
+- `YTDLP_COOKIES_TEXT` or `YOUTUBE_COOKIES`: optional Netscape-format cookies
+  text. The backend writes this to a temporary file for yt-dlp.
+- `YTDLP_COOKIES_BASE64` or `YOUTUBE_COOKIES_BASE64`: optional base64 encoded
+  Netscape-format cookies text. This is the easiest Render secret format for a
+  multiline cookies file.
 - `STREAM_USER_AGENT`: optional user agent used by `/stream/<id>` when proxying
   the upstream audio bytes.

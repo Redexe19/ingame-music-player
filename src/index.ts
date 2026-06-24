@@ -3,6 +3,9 @@ import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { Innertube } from "youtubei.js";
 import { createRequire } from "node:module";
+import { existsSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const require = createRequire(import.meta.url);
 const ytDlp = require("yt-dlp-exec") as any;
@@ -21,9 +24,13 @@ const STREAM_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const YTDLP_ENABLED = process.env.YTDLP_ENABLED !== "false";
 const YTDLP_COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || process.env.YOUTUBE_COOKIES_FILE || "";
+const YTDLP_COOKIES_TEXT = process.env.YTDLP_COOKIES_TEXT || process.env.YOUTUBE_COOKIES || "";
+const YTDLP_COOKIES_BASE64 =
+  process.env.YTDLP_COOKIES_BASE64 || process.env.YOUTUBE_COOKIES_BASE64 || "";
 const YTDLP_FORMAT =
   process.env.YTDLP_FORMAT ||
   "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best";
+const resolvedCookiesFile = prepareYtDlpCookiesFile();
 
 const ytClients = new Map<string, Innertube>();
 const ytInitPromises = new Map<string, Promise<Innertube>>();
@@ -86,6 +93,7 @@ app.get("/health", (c) =>
     clients: YOUTUBE_CLIENTS,
     readyClients: Array.from(ytClients.keys()),
     ytDlpEnabled: YTDLP_ENABLED,
+    ytDlpCookiesConfigured: !!resolvedCookiesFile,
   }),
 );
 
@@ -184,6 +192,22 @@ function normalizeClient(client?: string): string {
 
 function clientOrder(clients: string[]): string[] {
   return unique(clients.map(normalizeClient).concat(YOUTUBE_CLIENTS));
+}
+
+function prepareYtDlpCookiesFile(): string {
+  if (YTDLP_COOKIES_FILE && existsSync(YTDLP_COOKIES_FILE)) {
+    return YTDLP_COOKIES_FILE;
+  }
+
+  const rawCookies = YTDLP_COOKIES_BASE64
+    ? Buffer.from(YTDLP_COOKIES_BASE64, "base64").toString("utf8")
+    : YTDLP_COOKIES_TEXT;
+
+  if (!rawCookies.trim()) return "";
+
+  const cookieFile = join(tmpdir(), "ingame-music-player-youtube-cookies.txt");
+  writeFileSync(cookieFile, rawCookies, { encoding: "utf8", mode: 0o600 });
+  return cookieFile;
 }
 
 function getThumbnail(thumbnails: any): string {
@@ -531,7 +555,7 @@ async function resolveWithYtDlp(videoId: string): Promise<ResolveResult> {
     skipDownload: true,
     format: YTDLP_FORMAT,
   };
-  if (YTDLP_COOKIES_FILE) flags.cookies = YTDLP_COOKIES_FILE;
+  if (resolvedCookiesFile) flags.cookies = resolvedCookiesFile;
 
   try {
     const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, flags, {
