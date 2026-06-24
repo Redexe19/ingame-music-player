@@ -38,6 +38,10 @@ YouTube streaming backend for Ingame Music Player.
 `GET /stream/<id>` proxies raw audio bytes to Minecraft. It supports `Range`
 requests and returns `audio/mp4` when YouTube exposes an AAC/M4A stream.
 
+The resolver first tries youtubei.js client profiles, then falls back to
+`yt-dlp` when available. The fallback still streams only: it resolves a
+temporary upstream audio URL and proxies bytes through `/stream/<id>`.
+
 ## Config
 
 - `PORT`: server port. Render sets this automatically.
@@ -46,5 +50,11 @@ requests and returns `audio/mp4` when YouTube exposes an AAC/M4A stream.
   resolve. Defaults to `IOS,ANDROID,WEB,MWEB`.
 - `YOUTUBE_CLIENT`: older single-client override. Used only when
   `YOUTUBE_CLIENTS` is not set.
+- `YTDLP_ENABLED`: set to `false` to disable the yt-dlp fallback. Defaults to
+  enabled.
+- `YTDLP_FORMAT`: yt-dlp format selector. Defaults to
+  `bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best`.
+- `YTDLP_COOKIES_FILE` or `YOUTUBE_COOKIES_FILE`: optional path to a cookies
+  file if the host needs an authenticated resolver session.
 - `STREAM_USER_AGENT`: optional user agent used by `/stream/<id>` when proxying
   the upstream audio bytes.

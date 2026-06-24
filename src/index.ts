@@ -2,6 +2,10 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { Innertube } from "youtubei.js";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const ytDlp = require("yt-dlp-exec") as any;
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const IS_RENDER = !!process.env.RENDER_EXTERNAL_URL;
@@ -15,9 +19,16 @@ const DEFAULT_YOUTUBE_CLIENT = YOUTUBE_CLIENTS[0] || "IOS";
 const STREAM_USER_AGENT =
   process.env.STREAM_USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const YTDLP_ENABLED = process.env.YTDLP_ENABLED !== "false";
+const YTDLP_COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || process.env.YOUTUBE_COOKIES_FILE || "";
+const YTDLP_FORMAT =
+  process.env.YTDLP_FORMAT ||
+  "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best";
 
 const ytClients = new Map<string, Innertube>();
 const ytInitPromises = new Map<string, Promise<Innertube>>();
+const STREAM_CACHE_TTL_MS = 8 * 60 * 1000;
+const streamCache = new Map<string, { expiresAt: number; result: Extract<ResolveResult, { ok: true }> }>();
 
 async function getYouTube(clientName = DEFAULT_YOUTUBE_CLIENT): Promise<Innertube> {
   const client = normalizeClient(clientName);
@@ -74,6 +85,7 @@ app.get("/health", (c) =>
     status: "ok",
     clients: YOUTUBE_CLIENTS,
     readyClients: Array.from(ytClients.keys()),
+    ytDlpEnabled: YTDLP_ENABLED,
   }),
 );
 
@@ -91,9 +103,13 @@ app.get("/stream/:videoId", async (c) => {
   const videoId = c.req.param("videoId");
   const range = c.req.header("Range");
   const requestedClient = c.req.query("client") || DEFAULT_YOUTUBE_CLIENT;
+  const requestedResolver = c.req.query("resolver") || "";
 
   try {
-    const resolved = await resolveFirstPlayable(videoId, [requestedClient, ...YOUTUBE_CLIENTS]);
+    const resolved =
+      requestedResolver === "ytdlp"
+        ? await resolveWithCache(videoId, cacheKey(videoId, "ytdlp"), () => resolveWithYtDlp(videoId))
+        : await resolveFirstPlayable(videoId, [requestedClient, ...YOUTUBE_CLIENTS]);
     if (!resolved.ok) return resolveErrorJson(c, resolved);
 
     const { format, streamUrl } = resolved;
@@ -420,9 +436,152 @@ function logFormatFailure(videoId: string, info: any) {
   }
 }
 
+function cacheKey(videoId: string, resolver: string, client = ""): string {
+  return `${resolver}:${client}:${videoId}`;
+}
+
+async function resolveWithCache(
+  videoId: string,
+  key: string,
+  loader: () => Promise<ResolveResult>,
+): Promise<ResolveResult> {
+  const cached = streamCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
+  const result = await loader();
+  if (result.ok) {
+    streamCache.set(key, {
+      expiresAt: Date.now() + STREAM_CACHE_TTL_MS,
+      result,
+    });
+  }
+  return result;
+}
+
+function ytdlpContentType(info: any): string {
+  const ext = String(info?.ext || info?.requested_downloads?.[0]?.ext || "").toLowerCase();
+  const acodec = String(info?.acodec || info?.requested_downloads?.[0]?.acodec || "").toLowerCase();
+
+  if (ext === "m4a" || ext === "mp4" || acodec.includes("mp4a")) return "audio/mp4";
+  if (ext === "mp3") return "audio/mpeg";
+  if (ext === "ogg" || ext === "opus") return "audio/ogg";
+  if (ext === "webm" || acodec.includes("opus")) return "audio/webm";
+  return "audio/mp4";
+}
+
+function ytdlpStreamUrl(info: any): string {
+  return String(
+    info?.requested_downloads?.[0]?.url ||
+      info?.url ||
+      info?.formats?.find((format: any) => isAudioFormat(format) && format.url)?.url ||
+      "",
+  );
+}
+
+function ytdlpErrorResult(err: any): ResolveResult {
+  const message = String(err?.stderr || err?.message || err || "");
+  const lower = message.toLowerCase();
+
+  if (
+    lower.includes("sign in") ||
+    lower.includes("not a bot") ||
+    lower.includes("cookies") ||
+    lower.includes("login") ||
+    lower.includes("confirm")
+  ) {
+    return {
+      ok: false,
+      blocked: {
+        code: "YOUTUBE_LOGIN_REQUIRED",
+        message: "YouTube requires sign-in or bot verification for this backend.",
+        details: message.slice(0, 700),
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    error: {
+      code: "YTDLP_RESOLVE_FAILED",
+      message: "yt-dlp could not resolve a playable YouTube stream.",
+      details: message.slice(0, 700),
+      status: 502,
+    },
+  };
+}
+
+async function resolveWithYtDlp(videoId: string): Promise<ResolveResult> {
+  if (!YTDLP_ENABLED) {
+    return {
+      ok: false,
+      error: {
+        code: "YTDLP_DISABLED",
+        message: "yt-dlp fallback is disabled.",
+        status: 503,
+      },
+    };
+  }
+
+  const flags: Record<string, any> = {
+    dumpSingleJson: true,
+    noWarnings: true,
+    noPlaylist: true,
+    skipDownload: true,
+    format: YTDLP_FORMAT,
+  };
+  if (YTDLP_COOKIES_FILE) flags.cookies = YTDLP_COOKIES_FILE;
+
+  try {
+    const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, flags, {
+      timeout: Number(process.env.YTDLP_TIMEOUT_MS || 70000),
+    });
+    const streamUrl = ytdlpStreamUrl(info);
+    if (!streamUrl) {
+      return {
+        ok: false,
+        error: {
+          code: "YTDLP_NO_AUDIO_URL",
+          message: "yt-dlp did not return a playable audio URL.",
+          status: 404,
+        },
+      };
+    }
+
+    const title = textValue(info.title);
+    const artist = textValue(info.artist) || textValue(info.uploader) || textValue(info.channel);
+    const format = {
+      url: streamUrl,
+      mime_type: ytdlpContentType(info),
+      bitrate: Number(info.abr || info.tbr || 0) * 1000,
+      audio_quality: "AUDIO_QUALITY_MEDIUM",
+    };
+
+    return {
+      ok: true,
+      resolver: "ytdlp",
+      client: "YTDLP",
+      info,
+      basic: {
+        title,
+        author: artist,
+        duration: Number(info.duration || 0),
+        thumbnail: [{ url: info.thumbnail || "" }],
+      },
+      format,
+      streamUrl,
+    };
+  } catch (err: any) {
+    console.error(`[yt-dlp Resolve Error] ${videoId}: ${err?.message || err}`);
+    return ytdlpErrorResult(err);
+  }
+}
+
 type ResolveResult =
   | {
       ok: true;
+      resolver: "youtubei" | "ytdlp";
       client: string;
       info: any;
       basic: any;
@@ -477,6 +636,7 @@ async function resolveFirstPlayable(videoId: string, clients = YOUTUBE_CLIENTS):
 
       return {
         ok: true,
+        resolver: "youtubei",
         client: normalizedClient,
         info,
         basic,
@@ -501,6 +661,15 @@ async function resolveFirstPlayable(videoId: string, clients = YOUTUBE_CLIENTS):
         };
       }
     }
+  }
+
+  if (YTDLP_ENABLED) {
+    const ytdlpResult = await resolveWithCache(videoId, cacheKey(videoId, "ytdlp"), () =>
+      resolveWithYtDlp(videoId),
+    );
+    if (ytdlpResult.ok) return ytdlpResult;
+    if (ytdlpResult.error) lastError = ytdlpResult.error;
+    if (ytdlpResult.blocked) lastBlocked = ytdlpResult.blocked;
   }
 
   if (lastError) return { ok: false, error: lastError };
@@ -580,16 +749,21 @@ async function resolve(c: any, videoId: string) {
     const resolved = await resolveFirstPlayable(videoId);
     if (!resolved.ok) return resolveErrorJson(c, resolved);
 
-    const { basic, client, format } = resolved;
+    const { basic, client, format, resolver } = resolved;
+    const streamQuery =
+      resolver === "ytdlp"
+        ? "resolver=ytdlp"
+        : `resolver=youtubei&client=${encodeURIComponent(client)}`;
 
     return c.json({
-      streamUrl: `${getBaseUrl(c)}/stream/${videoId}?client=${encodeURIComponent(client)}`,
+      streamUrl: `${getBaseUrl(c)}/stream/${videoId}?${streamQuery}`,
       contentType: getContentType(format),
       title: textValue(basic.title),
       artist: textValue(basic.channel) || textValue(basic.author),
       durationSeconds: parseDurationSeconds(basic.duration),
       thumbnailUrl: getThumbnail((basic as any).thumbnail || (basic as any).thumbnails),
       originalUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      backendResolver: resolver,
       backendClient: client,
     });
   } catch (err: any) {
