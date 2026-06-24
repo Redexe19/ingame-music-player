@@ -54,6 +54,8 @@ temporary upstream audio URL and proxies bytes through `/stream/<id>`.
   enabled.
 - `YTDLP_FORMAT`: yt-dlp format selector. Defaults to
   `bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best`.
+- `YTDLP_FORMATS`: semicolon-separated yt-dlp format selectors to try in
+  order. Built-in fallbacks are always appended.
 - `YTDLP_COOKIES_FILE` or `YOUTUBE_COOKIES_FILE`: optional path to a cookies
   file if the host needs an authenticated resolver session.
 - `YTDLP_COOKIES_TEXT` or `YOUTUBE_COOKIES`: optional Netscape-format cookies

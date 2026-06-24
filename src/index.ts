@@ -27,9 +27,19 @@ const YTDLP_COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || process.env.YOUTUBE
 const YTDLP_COOKIES_TEXT = process.env.YTDLP_COOKIES_TEXT || process.env.YOUTUBE_COOKIES || "";
 const YTDLP_COOKIES_BASE64 =
   process.env.YTDLP_COOKIES_BASE64 || process.env.YOUTUBE_COOKIES_BASE64 || "";
-const YTDLP_FORMAT =
-  process.env.YTDLP_FORMAT ||
-  "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best";
+const YTDLP_FORMATS = unique(
+  [
+    ...(process.env.YTDLP_FORMATS || process.env.YTDLP_FORMAT || "")
+      .split(";")
+      .map((format) => format.trim())
+      .filter(Boolean),
+    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+    "bestaudio/best",
+    "ba/b",
+    "worstaudio/worst",
+  ].filter(Boolean),
+);
+const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 22000);
 const resolvedCookiesFile = prepareYtDlpCookiesFile();
 
 const ytClients = new Map<string, Innertube>();
@@ -94,6 +104,7 @@ app.get("/health", (c) =>
     readyClients: Array.from(ytClients.keys()),
     ytDlpEnabled: YTDLP_ENABLED,
     ytDlpCookiesConfigured: !!resolvedCookiesFile,
+    ytDlpFormats: YTDLP_FORMATS,
   }),
 );
 
@@ -504,8 +515,9 @@ function ytdlpStreamUrl(info: any): string {
   );
 }
 
-function ytdlpErrorResult(err: any): ResolveResult {
+function ytdlpErrorResult(err: any, selector?: string): ResolveResult {
   const message = String(err?.stderr || err?.message || err || "");
+  const details = selector ? `format=${selector}; ${message}` : message;
   const lower = message.toLowerCase();
 
   if (
@@ -520,7 +532,7 @@ function ytdlpErrorResult(err: any): ResolveResult {
       blocked: {
         code: "YOUTUBE_LOGIN_REQUIRED",
         message: "YouTube requires sign-in or bot verification for this backend.",
-        details: message.slice(0, 700),
+        details: details.slice(0, 700),
       },
     };
   }
@@ -530,7 +542,7 @@ function ytdlpErrorResult(err: any): ResolveResult {
     error: {
       code: "YTDLP_RESOLVE_FAILED",
       message: "yt-dlp could not resolve a playable YouTube stream.",
-      details: message.slice(0, 700),
+      details: details.slice(0, 700),
       status: 502,
     },
   };
@@ -548,58 +560,75 @@ async function resolveWithYtDlp(videoId: string): Promise<ResolveResult> {
     };
   }
 
-  const flags: Record<string, any> = {
-    dumpSingleJson: true,
-    noWarnings: true,
-    noPlaylist: true,
-    skipDownload: true,
-    format: YTDLP_FORMAT,
-  };
-  if (resolvedCookiesFile) flags.cookies = resolvedCookiesFile;
+  let lastResult: ResolveResult | undefined;
+  for (const selector of YTDLP_FORMATS) {
+    const flags: Record<string, any> = {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noPlaylist: true,
+      skipDownload: true,
+      format: selector,
+    };
+    if (resolvedCookiesFile) flags.cookies = resolvedCookiesFile;
 
-  try {
-    const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, flags, {
-      timeout: Number(process.env.YTDLP_TIMEOUT_MS || 70000),
-    });
-    const streamUrl = ytdlpStreamUrl(info);
-    if (!streamUrl) {
-      return {
-        ok: false,
-        error: {
-          code: "YTDLP_NO_AUDIO_URL",
-          message: "yt-dlp did not return a playable audio URL.",
-          status: 404,
-        },
+    try {
+      const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, flags, {
+        timeout: YTDLP_TIMEOUT_MS,
+      });
+      const streamUrl = ytdlpStreamUrl(info);
+      if (!streamUrl) {
+        lastResult = {
+          ok: false,
+          error: {
+            code: "YTDLP_NO_AUDIO_URL",
+            message: "yt-dlp did not return a playable audio URL.",
+            details: `format=${selector}`,
+            status: 404,
+          },
+        };
+        continue;
+      }
+
+      const title = textValue(info.title);
+      const artist = textValue(info.artist) || textValue(info.uploader) || textValue(info.channel);
+      const format = {
+        url: streamUrl,
+        mime_type: ytdlpContentType(info),
+        bitrate: Number(info.abr || info.tbr || 0) * 1000,
+        audio_quality: "AUDIO_QUALITY_MEDIUM",
       };
+
+      console.log(`[yt-dlp Resolve] ${videoId} | format=${selector} | contentType=${format.mime_type}`);
+      return {
+        ok: true,
+        resolver: "ytdlp",
+        client: "YTDLP",
+        info,
+        basic: {
+          title,
+          author: artist,
+          duration: Number(info.duration || 0),
+          thumbnail: [{ url: info.thumbnail || "" }],
+        },
+        format,
+        streamUrl,
+      };
+    } catch (err: any) {
+      console.error(`[yt-dlp Resolve Error] ${videoId} | format=${selector}: ${err?.message || err}`);
+      lastResult = ytdlpErrorResult(err, selector);
     }
-
-    const title = textValue(info.title);
-    const artist = textValue(info.artist) || textValue(info.uploader) || textValue(info.channel);
-    const format = {
-      url: streamUrl,
-      mime_type: ytdlpContentType(info),
-      bitrate: Number(info.abr || info.tbr || 0) * 1000,
-      audio_quality: "AUDIO_QUALITY_MEDIUM",
-    };
-
-    return {
-      ok: true,
-      resolver: "ytdlp",
-      client: "YTDLP",
-      info,
-      basic: {
-        title,
-        author: artist,
-        duration: Number(info.duration || 0),
-        thumbnail: [{ url: info.thumbnail || "" }],
-      },
-      format,
-      streamUrl,
-    };
-  } catch (err: any) {
-    console.error(`[yt-dlp Resolve Error] ${videoId}: ${err?.message || err}`);
-    return ytdlpErrorResult(err);
   }
+
+  return (
+    lastResult || {
+      ok: false,
+      error: {
+        code: "YTDLP_RESOLVE_FAILED",
+        message: "yt-dlp could not resolve a playable YouTube stream.",
+        status: 502,
+      },
+    }
+  );
 }
 
 type ResolveResult =
@@ -621,6 +650,15 @@ type ResolveResult =
 async function resolveFirstPlayable(videoId: string, clients = YOUTUBE_CLIENTS): Promise<ResolveResult> {
   let lastBlocked: { code: string; message: string; details: string } | undefined;
   let lastError: { code: string; message: string; details?: string; status?: number } | undefined;
+
+  if (YTDLP_ENABLED && resolvedCookiesFile) {
+    const ytdlpResult = await resolveWithCache(videoId, cacheKey(videoId, "ytdlp"), () =>
+      resolveWithYtDlp(videoId),
+    );
+    if (ytdlpResult.ok) return ytdlpResult;
+    if (ytdlpResult.error) lastError = ytdlpResult.error;
+    if (ytdlpResult.blocked) lastBlocked = ytdlpResult.blocked;
+  }
 
   for (const client of clientOrder(clients)) {
     const normalizedClient = normalizeClient(client);
@@ -687,7 +725,7 @@ async function resolveFirstPlayable(videoId: string, clients = YOUTUBE_CLIENTS):
     }
   }
 
-  if (YTDLP_ENABLED) {
+  if (YTDLP_ENABLED && !resolvedCookiesFile) {
     const ytdlpResult = await resolveWithCache(videoId, cacheKey(videoId, "ytdlp"), () =>
       resolveWithYtDlp(videoId),
     );
