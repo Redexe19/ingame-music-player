@@ -42,7 +42,9 @@ requests and returns `audio/mp4` when YouTube exposes an AAC/M4A stream.
 
 - `PORT`: server port. Render sets this automatically.
 - `RENDER_EXTERNAL_URL`: public Render URL. Render usually sets this automatically.
-- `YOUTUBE_CLIENT`: youtubei.js client profile. Defaults to `IOS`, because it
-  returns normal AAC audio stream URLs for the Minecraft player path.
+- `YOUTUBE_CLIENTS`: comma-separated youtubei.js client profiles to try during
+  resolve. Defaults to `IOS,ANDROID,WEB,MWEB`.
+- `YOUTUBE_CLIENT`: older single-client override. Used only when
+  `YOUTUBE_CLIENTS` is not set.
 - `STREAM_USER_AGENT`: optional user agent used by `/stream/<id>` when proxying
   the upstream audio bytes.

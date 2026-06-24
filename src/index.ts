@@ -5,44 +5,58 @@ import { Innertube } from "youtubei.js";
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const IS_RENDER = !!process.env.RENDER_EXTERNAL_URL;
-const YOUTUBE_CLIENT = process.env.YOUTUBE_CLIENT || "IOS";
+const YOUTUBE_CLIENTS = unique(
+  (process.env.YOUTUBE_CLIENTS || process.env.YOUTUBE_CLIENT || "IOS,ANDROID,WEB,MWEB")
+    .split(",")
+    .map((client) => client.trim().toUpperCase())
+    .filter(Boolean),
+);
+const DEFAULT_YOUTUBE_CLIENT = YOUTUBE_CLIENTS[0] || "IOS";
 const STREAM_USER_AGENT =
   process.env.STREAM_USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-let ytClient: Innertube | null = null;
-let ytInitPromise: Promise<Innertube> | null = null;
+const ytClients = new Map<string, Innertube>();
+const ytInitPromises = new Map<string, Promise<Innertube>>();
 
-async function getYouTube(): Promise<Innertube> {
-  if (ytClient) return ytClient;
-  if (ytInitPromise) return ytInitPromise;
+async function getYouTube(clientName = DEFAULT_YOUTUBE_CLIENT): Promise<Innertube> {
+  const client = normalizeClient(clientName);
+  const existing = ytClients.get(client);
+  if (existing) return existing;
 
-  ytInitPromise = Innertube.create({
+  const pending = ytInitPromises.get(client);
+  if (pending) return pending;
+
+  const initPromise = Innertube.create({
     generate_session_locally: true,
     location: "US",
     language: "en",
-    client: YOUTUBE_CLIENT,
+    client,
   } as any)
-    .then((client) => {
-      ytClient = client;
-      return client;
+    .then((yt) => {
+      ytClients.set(client, yt);
+      return yt;
     })
     .catch((err) => {
-      ytInitPromise = null;
+      ytInitPromises.delete(client);
       throw err;
     });
 
-  return ytInitPromise;
+  ytInitPromises.set(client, initPromise);
+  return initPromise;
 }
 
-async function resetYouTube(): Promise<void> {
-  try {
-    if (ytClient) await (ytClient.session as any).terminate?.();
-  } catch {
-    // Best effort shutdown only.
+async function resetYouTube(clientName?: string): Promise<void> {
+  const clients = clientName ? [normalizeClient(clientName)] : Array.from(ytClients.keys());
+  for (const client of clients) {
+    try {
+      await (ytClients.get(client)?.session as any)?.terminate?.();
+    } catch {
+      // Best effort shutdown only.
+    }
+    ytClients.delete(client);
+    ytInitPromises.delete(client);
   }
-  ytClient = null;
-  ytInitPromise = null;
 }
 
 const app = new Hono();
@@ -58,7 +72,8 @@ app.get("/", (c) =>
 app.get("/health", (c) =>
   c.json({
     status: "ok",
-    youtubeClientReady: !!ytClient,
+    clients: YOUTUBE_CLIENTS,
+    readyClients: Array.from(ytClients.keys()),
   }),
 );
 
@@ -75,24 +90,13 @@ app.get("/youtube", async (c) => {
 app.get("/stream/:videoId", async (c) => {
   const videoId = c.req.param("videoId");
   const range = c.req.header("Range");
+  const requestedClient = c.req.query("client") || DEFAULT_YOUTUBE_CLIENT;
 
   try {
-    const info = await getInfo(videoId);
-    const blocked = getYouTubeBlock(info);
-    if (blocked) return blockedJson(c, blocked);
+    const resolved = await resolveFirstPlayable(videoId, [requestedClient, ...YOUTUBE_CLIENTS]);
+    if (!resolved.ok) return resolveErrorJson(c, resolved);
 
-    const fmt = await resolvePlayableFormat(videoId, info);
-    const streamUrl = fmt ? await getFormatUrl(fmt) : "";
-    if (!fmt || !streamUrl) {
-      logFormatFailure(videoId, info);
-      return errorJson(
-        c,
-        404,
-        "NO_AUDIO_FORMAT",
-        "YouTube did not return a playable audio stream.",
-        getPlayabilityReason(info),
-      );
-    }
+    const { format, streamUrl } = resolved;
 
     const headers: Record<string, string> = {
       "User-Agent": STREAM_USER_AGENT,
@@ -114,7 +118,7 @@ app.get("/stream/:videoId", async (c) => {
     }
 
     const responseHeaders: Record<string, string> = {
-      "Content-Type": getContentType(fmt),
+      "Content-Type": getContentType(format),
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
     };
@@ -128,14 +132,14 @@ app.get("/stream/:videoId", async (c) => {
     });
   } catch (err: any) {
     console.error(`[Stream Error] ${videoId}: ${err?.message || err}`);
-    if (isSessionError(err)) await resetYouTube();
+    if (isSessionError(err)) await resetYouTube(requestedClient);
     return errorJson(c, 500, "STREAM_FAILED", "Stream failed.", err?.message);
   }
 });
 
-async function getInfo(videoId: string) {
-  const yt = await getYouTube();
-  return yt.getInfo(videoId, { client: YOUTUBE_CLIENT } as any);
+async function getInfo(videoId: string, client = DEFAULT_YOUTUBE_CLIENT) {
+  const yt = await getYouTube(client);
+  return yt.getInfo(videoId, { client: normalizeClient(client) } as any);
 }
 
 function getBaseUrl(c: any): string {
@@ -152,6 +156,18 @@ function copyHeader(
 ) {
   const value = source.headers.get(headerName);
   if (value) target[headerName] = value;
+}
+
+function unique<T>(items: T[]): T[] {
+  return Array.from(new Set(items));
+}
+
+function normalizeClient(client?: string): string {
+  return (client || DEFAULT_YOUTUBE_CLIENT).trim().toUpperCase();
+}
+
+function clientOrder(clients: string[]): string[] {
+  return unique(clients.map(normalizeClient).concat(YOUTUBE_CLIENTS));
 }
 
 function getThumbnail(thumbnails: any): string {
@@ -215,12 +231,12 @@ function getFormatMime(format: any): string {
   return String(format?.mime_type || format?.mimeType || "").toLowerCase();
 }
 
-async function getFormatUrl(format: any): Promise<string> {
+async function getFormatUrl(format: any, client = DEFAULT_YOUTUBE_CLIENT): Promise<string> {
   if (!format) return "";
   if (format.url) return String(format.url);
 
   if (typeof format.decipher === "function") {
-    const player = (ytClient as any)?.session?.player;
+    const player = (await getYouTube(client) as any)?.session?.player;
     const url = await format.decipher(player);
     if (url) {
       format.url = url;
@@ -262,18 +278,19 @@ function findBestFormat(info: any) {
   return audioFormats.sort((a, b) => getFormatBitrate(b) - getFormatBitrate(a))[0] || null;
 }
 
-async function resolvePlayableFormat(videoId: string, info?: any) {
-  const yt = await getYouTube();
+async function resolvePlayableFormat(videoId: string, info: any, client = DEFAULT_YOUTUBE_CLIENT) {
+  const normalizedClient = normalizeClient(client);
+  const yt = await getYouTube(normalizedClient);
   const attempts = [
-    { type: "audio", quality: "best", format: "mp4", client: YOUTUBE_CLIENT },
-    { type: "audio", quality: "best", format: "any", client: YOUTUBE_CLIENT },
+    { type: "audio", quality: "best", format: "mp4", client: normalizedClient },
+    { type: "audio", quality: "best", format: "any", client: normalizedClient },
   ];
   let lastError: any = null;
 
   for (const options of attempts) {
     try {
       const format = await (yt as any).getStreamingData(videoId, options);
-      if (format && (await getFormatUrl(format))) return format;
+      if (format && (await getFormatUrl(format, normalizedClient))) return format;
     } catch (err) {
       lastError = err;
     }
@@ -282,7 +299,7 @@ async function resolvePlayableFormat(videoId: string, info?: any) {
   const fallback = findBestFormat(info);
   if (fallback) {
     try {
-      if (await getFormatUrl(fallback)) return fallback;
+      if (await getFormatUrl(fallback, normalizedClient)) return fallback;
     } catch (err) {
       lastError = err;
     }
@@ -403,9 +420,122 @@ function logFormatFailure(videoId: string, info: any) {
   }
 }
 
+type ResolveResult =
+  | {
+      ok: true;
+      client: string;
+      info: any;
+      basic: any;
+      format: any;
+      streamUrl: string;
+    }
+  | {
+      ok: false;
+      blocked?: { code: string; message: string; details: string };
+      error?: { code: string; message: string; details?: string; status?: number };
+    };
+
+async function resolveFirstPlayable(videoId: string, clients = YOUTUBE_CLIENTS): Promise<ResolveResult> {
+  let lastBlocked: { code: string; message: string; details: string } | undefined;
+  let lastError: { code: string; message: string; details?: string; status?: number } | undefined;
+
+  for (const client of clientOrder(clients)) {
+    const normalizedClient = normalizeClient(client);
+    try {
+      const info = await getInfo(videoId, normalizedClient);
+      const rawInfo = info as any;
+      const basic = rawInfo.basic_info || rawInfo.basicInfo || {};
+
+      console.log(
+        `[Resolve] ${videoId} | Client: ${normalizedClient} | Status: ${
+          getPlayabilityStatus(info) || "unknown"
+        } | Formats: ${getFormats(info).length}`,
+      );
+
+      const blocked = getYouTubeBlock(info);
+      if (blocked) {
+        lastBlocked = blocked;
+        console.error(
+          `[Resolve Blocked] ${videoId} | Client: ${normalizedClient} | ${blocked.code}: ${blocked.details}`,
+        );
+        await resetYouTube(normalizedClient);
+        continue;
+      }
+
+      const format = await resolvePlayableFormat(videoId, info, normalizedClient);
+      const streamUrl = format ? await getFormatUrl(format, normalizedClient) : "";
+      if (!format || !streamUrl) {
+        logFormatFailure(videoId, info);
+        lastError = {
+          code: "NO_AUDIO_FORMAT",
+          message: "YouTube did not return a playable audio stream.",
+          details: getPlayabilityReason(info),
+          status: 404,
+        };
+        continue;
+      }
+
+      return {
+        ok: true,
+        client: normalizedClient,
+        info,
+        basic,
+        format,
+        streamUrl,
+      };
+    } catch (err: any) {
+      console.error(`[Resolve Error] ${videoId} | Client: ${normalizedClient}: ${err?.message || err}`);
+      if (isSessionError(err)) {
+        await resetYouTube(normalizedClient);
+        lastBlocked = {
+          code: "YOUTUBE_LOGIN_REQUIRED",
+          message: "YouTube requires sign-in or bot verification for this backend.",
+          details: err?.message || "",
+        };
+      } else {
+        lastError = {
+          code: "RESOLVE_FAILED",
+          message: "Resolve failed.",
+          details: err?.message,
+          status: 500,
+        };
+      }
+    }
+  }
+
+  if (lastError) return { ok: false, error: lastError };
+  if (lastBlocked) return { ok: false, blocked: lastBlocked };
+
+  return {
+    ok: false,
+    error: {
+      code: "NO_AUDIO_FORMAT",
+      message: "YouTube did not return a playable audio stream.",
+      status: 404,
+    },
+  };
+}
+
+function resolveErrorJson(c: any, result: ResolveResult) {
+  if (result.ok) {
+    return errorJson(c, 500, "INTERNAL_ERROR", "Unexpected playable result in error path.");
+  }
+  if (result.error) {
+    return errorJson(
+      c,
+      result.error.status || 500,
+      result.error.code,
+      result.error.message,
+      result.error.details,
+    );
+  }
+  if (result.blocked) return blockedJson(c, result.blocked);
+  return errorJson(c, 500, "RESOLVE_FAILED", "Resolve failed.");
+}
+
 async function search(c: any, query: string) {
   try {
-    const yt = await getYouTube();
+    const yt = await getYouTube(DEFAULT_YOUTUBE_CLIENT);
     const results = await yt.search(query, { type: "video" });
 
     return c.json({
@@ -424,7 +554,7 @@ async function search(c: any, query: string) {
     if (isSessionError(err)) {
       await resetYouTube();
       try {
-        const yt = await getYouTube();
+        const yt = await getYouTube(DEFAULT_YOUTUBE_CLIENT);
         const results = await yt.search(query, { type: "video" });
         return c.json({
           results: (results.videos || []).slice(0, 15).map((video: any) => ({
@@ -447,43 +577,20 @@ async function search(c: any, query: string) {
 
 async function resolve(c: any, videoId: string) {
   try {
-    const info = await getInfo(videoId);
-    const rawInfo = info as any;
-    const basic = rawInfo.basic_info || rawInfo.basicInfo || {};
-    const blocked = getYouTubeBlock(info);
+    const resolved = await resolveFirstPlayable(videoId);
+    if (!resolved.ok) return resolveErrorJson(c, resolved);
 
-    console.log(
-      `[Resolve] ${videoId} | Status: ${getPlayabilityStatus(info) || "unknown"} | Formats: ${
-        getFormats(info).length
-      }`,
-    );
-
-    if (blocked) {
-      console.error(`[Resolve Blocked] ${videoId} | ${blocked.code}: ${blocked.details}`);
-      return blockedJson(c, blocked);
-    }
-
-    const fmt = await resolvePlayableFormat(videoId, info);
-    const streamUrl = fmt ? await getFormatUrl(fmt) : "";
-    if (!fmt || !streamUrl) {
-      logFormatFailure(videoId, info);
-      return errorJson(
-        c,
-        404,
-        "NO_AUDIO_FORMAT",
-        "YouTube did not return a playable audio stream.",
-        getPlayabilityReason(info),
-      );
-    }
+    const { basic, client, format } = resolved;
 
     return c.json({
-      streamUrl: `${getBaseUrl(c)}/stream/${videoId}`,
-      contentType: getContentType(fmt),
+      streamUrl: `${getBaseUrl(c)}/stream/${videoId}?client=${encodeURIComponent(client)}`,
+      contentType: getContentType(format),
       title: textValue(basic.title),
       artist: textValue(basic.channel) || textValue(basic.author),
       durationSeconds: parseDurationSeconds(basic.duration),
       thumbnailUrl: getThumbnail((basic as any).thumbnail || (basic as any).thumbnails),
       originalUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      backendClient: client,
     });
   } catch (err: any) {
     console.error(`[Resolve Error] ${videoId}: ${err?.message || err}`);
@@ -512,6 +619,6 @@ serve(
 );
 
 process.on("SIGINT", async () => {
-  if (ytClient) await (ytClient.session as any).terminate?.().catch(() => {});
+  await resetYouTube();
   process.exit(0);
 });
